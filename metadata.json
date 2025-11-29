@@ -1,0 +1,14 @@
+{
+  "project": "Autonomous Financial Coach for Gig & Informal Workers",
+  "track": "Build an autonomous financial coaching agent that adapts to real user behavior, spending patterns, and income variability - helping gig workers, informal sector employees, and everyday citizens make smarter financial decisions proactively.",
+  "agentic_features": {
+    "autonomous_planning": true,
+    "adaptive_learning": true,
+    "proactive_interventions": true,
+    "personalization_engine": true,
+    "realtime_behavior_analysis": true,
+    "dynamic_goal_setting": true,
+    "feedback_loop_integration": true
+  },
+  "description": "Our agent continuously observes user income, spending, and behavior patterns, then proactively generates personalized financial recommendations — save now, expect shortfall, adjust budget — without user prompting. It learns from feedback and adapts strategies over time, delivering a fully autonomous financial coaching agent built for financial resilience in variable-income populations."
+}

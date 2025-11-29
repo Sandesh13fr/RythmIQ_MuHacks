@@ -1,0 +1,376 @@
+"use server";
+
+import aj from "@/lib/arcjet";
+import { db } from "@/lib/prisma";
+import { request } from "@arcjet/next";
+import { auth } from "@clerk/nextjs/server";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { revalidatePath } from "next/cache";
+import { sendEmail } from "./send-email";
+import TransactionEmail from "@/emails/transaction-email";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+const serializeAmount = (obj) => ({
+  ...obj,
+  amount: obj.amount.toNumber(),
+});
+
+export async function createTransaction(data) {
+  try {
+    const { userId } = await auth();
+    if (!userId) throw new Error("Unauthorized");
+
+    const req = await request();
+    const decision = await aj.protect(req, {
+      userId,
+      requested: 1,
+    });
+
+    if (decision.isDenied()) {
+      if (decision.reason.isRateLimit()) {
+        const { remaining, reset } = decision.reason;
+        console.error({
+          code: "RATE_LIMIT_EXCEEDED",
+          details: {
+            remaining,
+            resetInSeconds: reset,
+          },
+        });
+
+        throw new Error("Too many requests. Please try again later.");
+      }
+
+      throw new Error("Request blocked");
+    }
+
+    const user = await db.user.findUnique({
+      where: { clerkUserId: userId },
+    });
+
+    if (!user) {
+      throw new Error("User not Found");
+    }
+
+    const account = await db.account.findUnique({
+      where: {
+        id: data.accountId,
+        userId: user.id,
+      },
+    });
+
+    if (!account) {
+      throw new Error("Account not found");
+    }
+
+    const balanceChange = data.type === "EXPENSE" ? -data.amount : data.amount;
+    const newBalance = account.balance.toNumber() + balanceChange;
+
+    const transaction = await db.$transaction(async (tx) => {
+      const newTransaction = await tx.transaction.create({
+        data: {
+          ...data,
+          userId: user.id,
+          nextRecurringDate:
+            data.isRecurring && data.recurringInterval
+              ? calculateNextRecurringDate(data.date, data.recurringInterval)
+              : null,
+        },
+      });
+
+      await tx.account.update({
+        where: { id: data.accountId },
+        data: {
+          balance: {
+            increment: balanceChange,
+          },
+        },
+      });
+
+      return newTransaction;
+    });
+
+    // --- Generate Embedding (RAG) ---
+    // We do this after the transaction to not block the UI response too much
+    // In a real app, this should be a background job
+    try {
+      const { generateEmbedding, transactionToText } = await import("@/lib/rag");
+      const text = transactionToText(transaction);
+      const embedding = await generateEmbedding(text);
+
+      if (embedding) {
+        const vectorString = `[${embedding.join(",")}]`;
+        await db.$executeRaw`
+          UPDATE transactions
+          SET embedding = ${vectorString}::vector
+          WHERE id = ${transaction.id}
+        `;
+      }
+    } catch (ragError) {
+      console.error("Error generating embedding:", ragError);
+    }
+
+    revalidatePath("/dashboard");
+    revalidatePath(`/account/${data.accountId}`);
+
+    // --- Send Email Notification ---
+    try {
+      // 1. Generate AI Insight (Short & Witty)
+      const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+      const prompt = `
+        Generate a very short (1 sentence), witty, and personalized comment about this transaction for the user.
+        Transaction: ${data.type} of ${data.amount} for ${data.description} (${data.category}).
+        Current Balance: ${newBalance}.
+        Tone: Helpful, slightly humorous, like a financial friend.
+        Example: "Whoa, big spender! Hope that coffee was worth it." or "Nice! Saving money is always a good look."
+      `;
+      const result = await model.generateContent(prompt);
+      const aiInsight = result.response.text();
+
+      // 2. Send Email
+      await sendEmail({
+        to: user.email,
+        subject: `RythmIQ Alert: ${data.type === "EXPENSE" ? "Spent" : "Received"} ₹${data.amount}`,
+        react: TransactionEmail({
+          userName: user.name,
+          type: data.type,
+          amount: data.amount,
+          description: data.description,
+          category: data.category,
+          date: new Date(data.date),
+          accountName: account.name,
+          newBalance: newBalance.toFixed(2),
+          aiInsight: aiInsight,
+        }),
+      });
+    } catch (emailError) {
+      console.error("Error sending email:", emailError);
+      // Don't fail the transaction if email fails
+    }
+
+    return { success: true, data: serializeAmount(transaction) };
+  } catch (error) {
+    throw new Error(error.message);
+  }
+}
+
+// Helper function to calculate next recurring date
+function calculateNextRecurringDate(startDate, interval) {
+  const date = new Date(startDate);
+
+  switch (interval) {
+    case "DAILY":
+      date.setDate(date.getDate() + 1);
+      break;
+    case "WEEKLY":
+      date.setDate(date.getDate() + 7);
+      break;
+    case "MONTHLY":
+      date.setMonth(date.getMonth() + 1);
+      break;
+    case "YEARLY":
+      date.setFullYear(date.getFullYear() + 1);
+      break;
+  }
+
+  return date;
+}
+
+export async function scanReceipt(file) {
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+    // Convert File to ArrayBuffer
+    const arrayBuffer = await file.arrayBuffer();
+    // Convert ArrayBuffer to Base64
+    const base64String = Buffer.from(arrayBuffer).toString("base64");
+
+    const prompt = `
+      Analyze this receipt image and extract the following information in JSON format:
+      - Total amount (just the number)
+      - Date (in ISO format)
+      - Description or items purchased (brief summary)
+      - Merchant/store name
+      - Suggested category (one of: housing, transportation, groceries, utilities, entertainment, food, shopping, healthcare, education, personal, travel, insurance, gifts, bills, other-expense )
+      
+      Only respond with valid JSON in this exact format:
+      {
+        "amount": number,
+        "date": "ISO date string",
+        "description": "string",
+        "merchantName": "string",
+        "category": "string"
+      }
+
+      If it's not a receipt, return an empty object.
+    `;
+
+    const result = await model.generateContent([
+      {
+        inlineData: {
+          data: base64String,
+          mimeType: file.type,
+        },
+      },
+      prompt,
+    ]);
+
+    const response = await result.response;
+    const text = response.text();
+    const cleanedText = text.replace(/```(?:json)?\n?/g, "").trim();
+
+    try {
+      const data = JSON.parse(cleanedText);
+      return {
+        amount: parseFloat(data.amount),
+        date: new Date(data.date),
+        description: data.description,
+        category: data.category,
+        merchantName: data.merchantName,
+      };
+    } catch (parseError) {
+      console.error("Error parsing JSON response:", parseError);
+      throw new Error("Invalid response format from Gemini");
+    }
+  } catch (error) {
+    console.error("Error scanning receipt:", error.message);
+    throw new Error("Failed to scan receipt");
+  }
+}
+
+export async function getTransaction(id) {
+  const { userId } = await auth();
+  if (!userId) throw new Error("Unauthorized");
+
+  const user = await db.user.findUnique({
+    where: { clerkUserId: userId },
+  });
+
+  if (!user) throw new Error("User not found");
+
+  const transaction = await db.transaction.findUnique({
+    where: {
+      id: id, // ✅ Corrected issue here
+      userId: user.id,
+    },
+  });
+
+  if (!transaction) throw new Error("Transaction not found");
+
+  return serializeAmount(transaction);
+}
+
+export async function updateTransaction(id, data) {
+  try {
+    const { userId } = await auth();
+    if (!userId) throw new Error("Unauthorized");
+
+    const user = await db.user.findUnique({
+      where: { clerkUserId: userId },
+    });
+
+    if (!user) throw new Error("User not found");
+
+    const originalTransaction = await db.transaction.findUnique({
+      where: {
+        id,
+        userId: user.id,
+      },
+      include: {
+        account: true,
+      },
+    });
+
+    if (!originalTransaction) throw new Error("Transaction not found");
+
+    // Convert amount to number before calculations
+    const oldBalanceChange =
+      originalTransaction.type === "EXPENSE"
+        ? -originalTransaction.amount.toNumber()
+        : originalTransaction.amount.toNumber();
+
+    const newBalanceChange =
+      data.type === "EXPENSE" ? -Number(data.amount) : Number(data.amount);
+
+    const netBalanceChange = newBalanceChange - oldBalanceChange;
+
+    // Update transaction and account balance in a transaction
+    const transaction = await db.$transaction(async (tx) => {
+      const updated = await tx.transaction.update({
+        where: {
+          id,
+          userId: user.id,
+        },
+        data: {
+          ...data,
+          nextRecurringDate:
+            data.isRecurring && data.recurringInterval
+              ? calculateNextRecurringDate(data.date, data.recurringInterval)
+              : null,
+        },
+      });
+
+      // Update account balance
+      await tx.account.update({
+        where: { id: data.accountId },
+        data: {
+          balance: {
+            increment: netBalanceChange,
+          },
+        },
+      });
+
+      return updated;
+    });
+
+    // --- Regenerate Embedding (RAG) ---
+    try {
+      const { generateEmbedding, transactionToText } = await import("@/lib/rag");
+      const text = transactionToText(transaction);
+      const embedding = await generateEmbedding(text);
+
+      if (embedding) {
+        const vectorString = `[${embedding.join(",")}]`;
+        await db.$executeRaw`
+          UPDATE transactions
+          SET embedding = ${vectorString}::vector
+          WHERE id = ${transaction.id}
+        `;
+      }
+    } catch (ragError) {
+      console.error("Error regenerating embedding:", ragError);
+    }
+
+    revalidatePath("/dashboard");
+    revalidatePath(`/account/${data.accountId}`);
+    return { success: true, data: serializeAmount(transaction) };
+  } catch (error) {
+    throw new Error(error.message);
+  }
+}
+
+export async function createRecurringTransactionFromDetection(detection) {
+  try {
+    const { userId } = await auth();
+    // detection: { merchant, amount, accountId, category(optional), recurringInterval } 
+    const user = await db.user.findUnique({ where: { clerkUserId: userId } });
+    const defaultAcc = user.accounts?.find(a => a.isDefault);
+    const accountId = detection.accountId || defaultAcc?.id;
+
+    const payload = {
+      type: 'EXPENSE',
+      amount: parseFloat(detection.amount || 0),
+      description: detection.merchant || detection.description || 'Recurring Subscription',
+            accountId: accountId,
+      category: detection.category || 'subscriptions',
+      date: new Date(),
+      isRecurring: true,
+      recurringInterval: detection.recurringInterval || 'MONTHLY',
+    };
+
+    return await createTransaction(payload);
+  } catch (error) {
+    console.error('Create Recurring From Detection Error:', error);
+    return { success: false, error: error.message };
+  }
+}

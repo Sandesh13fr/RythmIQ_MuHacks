@@ -1,0 +1,354 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id               String            @id @default(uuid())
+  clerkUserId      String            @unique // clerk user id
+  email            String            @unique
+  name             String?
+  imageUrl         String?
+  transactions     Transaction[]
+  accounts         Account[]
+  budgets          Budget[]
+  insights         Insight[]
+  chatMessages     ChatMessage[]
+  financialProfile FinancialProfile?
+  nudgeActions     NudgeAction[]
+  goals            Goal[]
+  bills            Bill[]
+  riskSnapshots    RiskSnapshot[]
+  billEnvelopes    BillEnvelope[]
+  securityAuditLogs SecurityAuditLog[]
+  agentSafetyState AgentSafetyState?
+  otpChallenges    OtpChallenge[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@map("users")
+}
+
+model Account {
+  id           String        @id @default(uuid())
+  name         String
+  type         AccountType
+  balance      Decimal       @default(0) // will ask inital balance while creating an account
+  isDefault    Boolean       @default(false)
+  userId       String
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Transaction {
+  id                String             @id @default(uuid())
+  type              TransactionType
+  amount            Decimal
+  description       String?
+  date              DateTime
+  category          String
+  receiptUrl        String?
+  isRecurring       Boolean            @default(false)
+  recurrencePaused  Boolean            @default(false)
+  recurringInterval RecurringInterval? // Only used if isRecurring is true
+  nextRecurringDate DateTime? // Next date for recurring transaction
+  lastProcessed     DateTime? // Last time this recurring transaction was processed
+  status            TransactionStatus  @default(COMPLETED)
+  userId            String
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId         String
+  account           Account            @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  // embedding         Unsupported("vector(768)")? // Gemini embedding dimension - commented out for now
+
+  @@index([userId])
+  @@index([accountId])
+  @@map("transactions")
+}
+
+model Budget {
+  id            String    @id @default(uuid())
+  amount        Decimal
+  isLocked      Boolean   @default(false) // Safety Guardian: locked budgets
+  lastAlertSent DateTime? // Track when the last alert was sent
+  userId        String    @unique
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("budgets")
+}
+
+model Insight {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content   String
+  type      String // e.g., "SAVINGS", "EXPENSE", "BUDGET"
+  action    String? // Safety Guardian: action taken (e.g., "LOCKED_BUDGET")
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("insights")
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      String // "user" or "assistant"
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("chat_messages")
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+enum AccountType {
+  CURRENT
+  SAVINGS
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum RecurringInterval {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+model FinancialProfile {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Personality Quiz Answers
+  happyPurchase  String? // What made them happy
+  regretPurchase String? // What they regret
+  financialFear  String? // Biggest fear
+  savingGoal     String? // What they're saving for
+  moneyFeeling   String? // How they feel about money
+
+  // Behavioral Patterns (AI-learned)
+  riskTolerance     String   @default("MODERATE") // LOW, MODERATE, HIGH
+  spendingStyle     String   @default("BALANCED") // IMPULSIVE, BALANCED, CAUTIOUS
+  regretThreshold   Decimal  @default(0) // Amount above which they regret purchases
+  emotionalTriggers String[] @default([]) // Categories they overspend on when stressed
+
+  // Decision History
+  approvedDecisions Int @default(0)
+  rejectedDecisions Int @default(0)
+
+  // Personalization (NEW - Feedback Loop)
+  preferredNudgeTypes      String[] @default([]) // Nudge types user responds well to
+  dislikedNudgeTypes       String[] @default([]) // Nudge types user dismisses
+  optimalNudgeHour         Int?                   // Hour of day (0-23) when most responsive
+  nudgeFrequencyPreference String   @default("NORMAL") // LOW, NORMAL, HIGH
+  lastPersonalizationUpdate DateTime? // When preferences were last updated
+  incomeRhythm             Json?
+  spendRhythm              Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  autoNudgeEnabled Boolean @default(false)
+
+  @@index([userId])
+  @@map("financial_profiles")
+}
+
+model Goal {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  targetAmount Decimal
+  savedAmount Decimal  @default(0)
+  targetDate DateTime?
+  priority   Int      @default(0)
+  status     String   @default("active")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId])
+  @@map("goals")
+}
+
+model NudgeAction {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Nudge Details
+  nudgeType String // "auto-save", "bill-pay", "spending-alert", "income-opportunity", "emergency-buffer"
+  amount    Decimal?
+  message   String
+  reason    String // Explanation for why this nudge was generated
+
+  // Status Tracking
+  status   String @default("pending") // "pending", "accepted", "rejected", "expired", "executed"
+  priority Int    @default(0) // Higher number = higher priority
+
+  // Response Tracking
+  createdAt   DateTime  @default(now())
+  respondedAt DateTime?
+  executedAt  DateTime?
+  expiresAt   DateTime?
+
+  // Metadata
+  metadata Json? // Additional context (e.g., bill details, savings goal)
+  impact   Decimal? // Calculated financial impact after execution
+
+  // Feedback Loop (NEW)
+  feedbackRating  Int?     // 1-5 star rating
+  feedbackComment String?  // User's text feedback
+  wasHelpful      Boolean? // Quick thumbs up/down
+  dismissReason   String?  // Why user rejected (if status = rejected)
+  feedbackAt      DateTime? // When feedback was given
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([nudgeType]) // NEW: for analytics
+  @@map("nudge_actions")
+}
+
+
+model Bill {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Bill Details
+  name        String   // "Electricity", "Netflix", "Car EMI"
+  category    String   // "utilities", "subscription", "emi", "rent", "insurance"
+  amount      Decimal
+  dueDay      Int      // Day of month (1-31)
+  
+  // Status
+  isActive    Boolean  @default(true)
+  isPaid      Boolean  @default(false) // For current month
+  lastPaidDate DateTime?
+  nextDueDate DateTime
+  
+  // Auto-pay
+  autoPayEnabled Boolean @default(false)
+  reminderDays   Int     @default(3) // Days before due date to remind
+  
+  // Detection metadata
+  detectedFrom String? // "manual" or transaction ID if auto-detected
+  confidence   Int?    // 0-100 confidence score for auto-detected bills
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  envelopes   BillEnvelope[]
+
+  @@index([userId])
+  @@index([nextDueDate])
+  @@index([category])
+  @@map("bills")
+}
+
+model BillEnvelope {
+  id              String   @id @default(uuid())
+  billId          String
+  bill            Bill     @relation(fields: [billId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  protectedAmount Decimal  @default(0)
+  lockedUntil     DateTime?
+  status          String   @default("active") // active, released, expired
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([billId])
+  @@index([userId])
+  @@unique([billId, status])
+  @@map("bill_envelopes")
+}
+
+model RiskSnapshot {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  riskScore  Int
+  riskLevel  String
+  drivers    Json
+  forecast   Json?
+  metrics    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("risk_snapshots")
+}
+
+model SecurityAuditLog {
+  id          String   @id @default(uuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  actorType   String   @default("system")
+  action      String
+  amount      Decimal?
+  context     Json?
+  otpVerified Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@map("security_audit_logs")
+}
+
+model AgentSafetyState {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  autopilotLocked  Boolean  @default(false)
+  lockedAt         DateTime?
+  reason           String?
+  lastAnomaly      Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@map("agent_safety_states")
+}
+
+model OtpChallenge {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action    String
+  amount    Decimal?
+  otpHash   String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("otp_challenges")
+}

@@ -1,0 +1,35 @@
+
+model Bill {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Bill Details
+  name        String   // "Electricity", "Netflix", "Car EMI"
+  category    String   // "utilities", "subscription", "emi", "rent", "insurance"
+  amount      Decimal
+  dueDay      Int      // Day of month (1-31)
+  
+  // Status
+  isActive    Boolean  @default(true)
+  isPaid      Boolean  @default(false) // For current month
+  lastPaidDate DateTime?
+  nextDueDate DateTime
+  
+  // Auto-pay
+  autoPayEnabled Boolean @default(false)
+  reminderDays   Int     @default(3) // Days before due date to remind
+  
+  // Detection metadata
+  detectedFrom String? // "manual" or transaction ID if auto-detected
+  confidence   Int?    // 0-100 confidence score for auto-detected bills
+  
+  // Timestamps
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+  @@index([nextDueDate])
+  @@index([category])
+  @@map("bills")
+}
